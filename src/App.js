@@ -1,6 +1,6 @@
 import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { setupModels, analyzeFrame } from './utils/emotion';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { setupModels, analyzeFrameMulti } from './utils/emotion';
 import Papa from 'papaparse';
 import './index.css';
 import supabase from './lib/supabaseClient';
@@ -11,20 +11,72 @@ export default function App() {
     const [studentId, setStudentId] = useState('');
     const [studentName, setStudentName] = useState('');
     const [streaming, setStreaming] = useState(false);
-    // Load models once
+    const [autoAttendance, setAutoAttendance] = useState(true);
+    const canvasRef = useRef(null);
+    // Load models once, then auto-start camera
     useEffect(() => {
         setupModels().then(() => setReady(true)).catch(console.error);
     }, []);
+    // Process frames (multi-face)
+    const loop = useCallback(async () => {
+        if (!videoRef.current)
+            return;
+        const faces = await analyzeFrameMulti(videoRef.current);
+        // draw overlay
+        if (canvasRef.current && videoRef.current) {
+            const ctx = canvasRef.current.getContext('2d');
+            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+            ctx.strokeStyle = '#0ea5e9';
+            ctx.lineWidth = 2;
+            ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, monospace';
+            ctx.fillStyle = 'rgba(14,165,233,0.2)';
+            faces.forEach(f => {
+                ctx.strokeRect(f.box.x, f.box.y, f.box.width, f.box.height);
+                ctx.fillRect(f.box.x, f.box.y + f.box.height + 2, f.box.width, 16);
+                ctx.fillStyle = '#0ea5e9';
+                ctx.fillText(`${f.emotion} ${(f.confidence * 100).toFixed(0)}%`, f.box.x + 4, f.box.y + f.box.height + 14);
+                ctx.fillStyle = 'rgba(14,165,233,0.2)';
+            });
+        }
+        setSnapshots(prev => [
+            ...prev.slice(-120), // keep last ~120 frames
+            { timestamp: Date.now(), faces }
+        ]);
+        // upsert latest single reading if studentId set (choose highest-attention face)
+        if (studentId && faces.length) {
+            const top = faces.reduce((a, b) => (b.attention > a.attention ? b : a), faces[0]);
+            await supabase.from('emotion_stream').upsert({
+                student_id: studentId,
+                at: new Date().toISOString(),
+                emotion: top.emotion,
+                confidence: top.confidence,
+                attention: top.attention
+            });
+        }
+        if (streaming)
+            requestAnimationFrame(loop);
+    }, [streaming, studentId]);
     // Start webcam
-    async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    const startCamera = useCallback(async () => {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
         if (videoRef.current) {
             videoRef.current.srcObject = stream;
             await videoRef.current.play();
+            // size canvas to video
+            if (canvasRef.current) {
+                canvasRef.current.width = videoRef.current.videoWidth;
+                canvasRef.current.height = videoRef.current.videoHeight;
+            }
             setStreaming(true);
             loop();
         }
-    }
+    }, [loop]);
+    // Auto-start camera after models are ready
+    useEffect(() => {
+        if (ready && !streaming) {
+            startCamera().catch(console.error);
+        }
+    }, [ready, streaming, startCamera]);
     // Stop webcam
     function stopCamera() {
         if (videoRef.current?.srcObject) {
@@ -33,59 +85,38 @@ export default function App() {
             setStreaming(false);
         }
     }
-    // Process frames
-    async function loop() {
-        if (!videoRef.current)
-            return;
-        const res = await analyzeFrame(videoRef.current);
-        if (res) {
-            setSnapshots(prev => [
-                ...prev,
-                {
-                    timestamp: Date.now(),
-                    emotion: res.emotion,
-                    confidence: res.confidence,
-                    attention: res.attention
-                }
-            ]);
-            // upsert realtime row for live dashboard
-            if (studentId) {
-                await supabase.from('emotion_stream').upsert({
-                    student_id: studentId,
-                    at: new Date().toISOString(),
-                    emotion: res.emotion,
-                    confidence: res.confidence,
-                    attention: res.attention
-                });
-            }
-        }
-        if (streaming)
-            requestAnimationFrame(loop);
-    }
     // Mark attendance with latest snapshot
-    async function markAttendance() {
+    const markAttendance = useCallback(async () => {
         if (!studentId || !studentName)
-            return alert('Enter student id and name');
+            return;
         const latest = snapshots[snapshots.length - 1];
+        const face = latest?.faces?.[0];
         const { error } = await supabase.from('attendance').insert({
             student_id: studentId,
             student_name: studentName,
             at: new Date().toISOString(),
-            emotion: latest?.emotion ?? null,
-            attention: latest?.attention ?? null
+            emotion: face?.emotion ?? null,
+            attention: face?.attention ?? null
         });
         if (error)
             alert(error.message);
-        else
-            alert('Attendance marked!');
-    }
+    }, [snapshots, studentId, studentName]);
+    // Auto attendance interval
+    useEffect(() => {
+        if (!autoAttendance || !studentId || !studentName)
+            return;
+        const id = setInterval(() => {
+            markAttendance().catch(console.error);
+        }, 30000);
+        return () => clearInterval(id);
+    }, [autoAttendance, studentId, studentName, markAttendance]);
     const csvData = useMemo(() => {
-        return snapshots.map(s => ({
+        return snapshots.flatMap(s => s.faces.map(f => ({
             timestamp: new Date(s.timestamp).toISOString(),
-            emotion: s.emotion,
-            confidence: s.confidence.toFixed(3),
-            attention: s.attention.toFixed(3)
-        }));
+            emotion: f.emotion,
+            confidence: f.confidence.toFixed(3),
+            attention: f.attention.toFixed(3)
+        })));
     }, [snapshots]);
     function exportCSV() {
         const csv = Papa.unparse(csvData);
@@ -97,5 +128,5 @@ export default function App() {
         a.click();
         URL.revokeObjectURL(url);
     }
-    return (_jsxs("div", { className: "min-h-screen p-6 text-slate-900", children: [_jsx("h1", { className: "text-2xl font-semibold", children: "Edu Vision Dashboard" }), _jsxs("section", { className: "mt-4 grid gap-6 md:grid-cols-2", children: [_jsxs("div", { className: "rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Camera" }), _jsx("video", { ref: videoRef, className: "w-full rounded border" }), _jsxs("div", { className: "mt-3 flex items-center gap-2", children: [_jsx("button", { className: "btn", disabled: !ready || streaming, onClick: startCamera, children: "Start" }), _jsx("button", { className: "btn", disabled: !streaming, onClick: stopCamera, children: "Stop" }), !ready && _jsx("span", { className: "text-sm text-slate-500", children: "Loading models..." })] })] }), _jsxs("div", { className: "rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Student & Attendance" }), _jsxs("div", { className: "flex flex-col gap-2", children: [_jsx("input", { className: "input", placeholder: "Student ID", value: studentId, onChange: e => setStudentId(e.target.value) }), _jsx("input", { className: "input", placeholder: "Student Name", value: studentName, onChange: e => setStudentName(e.target.value) }), _jsxs("div", { className: "flex gap-2", children: [_jsx("button", { className: "btn", onClick: markAttendance, children: "Mark attendance" }), _jsx("button", { className: "btn-secondary", onClick: exportCSV, children: "Export CSV" })] })] })] })] }), _jsxs("section", { className: "mt-6 rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Live Readings" }), _jsx("div", { className: "grid grid-cols-1 gap-2 md:grid-cols-3", children: snapshots.slice(-6).reverse().map((s, i) => (_jsxs("div", { className: "rounded border p-3 text-sm", children: [_jsx("div", { className: "font-mono text-xs text-slate-500", children: new Date(s.timestamp).toLocaleTimeString() }), _jsxs("div", { children: ["Emotion: ", _jsx("b", { children: s.emotion }), " (", (s.confidence * 100).toFixed(1), "%)"] }), _jsxs("div", { children: ["Attention: ", _jsxs("b", { children: [(s.attention * 100).toFixed(0), "%"] })] })] }, i))) })] }), _jsx("footer", { className: "mt-6 text-xs text-slate-500", children: "Connected to Supabase Realtime for live data; CSV export stores local snapshot. Hook up Supabase Storage to persist CSVs by user if desired." })] }));
+    return (_jsxs("div", { className: "min-h-screen p-6 text-slate-900", children: [_jsx("h1", { className: "text-2xl font-semibold", children: "Edu Vision Dashboard" }), _jsxs("section", { className: "mt-4 grid gap-6 md:grid-cols-2", children: [_jsxs("div", { className: "rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Camera" }), _jsxs("div", { className: "relative w-full", children: [_jsx("video", { ref: videoRef, className: "w-full rounded border" }), _jsx("canvas", { ref: canvasRef, className: "pointer-events-none absolute left-0 top-0 h-full w-full" })] }), _jsxs("div", { className: "mt-3 flex flex-wrap items-center gap-2", children: [_jsx("button", { className: "btn", disabled: !ready || streaming, onClick: startCamera, children: "Start" }), _jsx("button", { className: "btn", disabled: !streaming, onClick: stopCamera, children: "Stop" }), !ready && _jsx("span", { className: "text-sm text-slate-500", children: "Loading models..." })] })] }), _jsxs("div", { className: "rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Student & Attendance" }), _jsxs("div", { className: "flex flex-col gap-2", children: [_jsx("input", { className: "input", placeholder: "Student ID", value: studentId, onChange: e => setStudentId(e.target.value) }), _jsx("input", { className: "input", placeholder: "Student Name", value: studentName, onChange: e => setStudentName(e.target.value) }), _jsxs("label", { className: "flex items-center gap-2 text-sm text-slate-600", children: [_jsx("input", { type: "checkbox", checked: autoAttendance, onChange: e => setAutoAttendance(e.target.checked) }), "Auto-mark attendance every 30s"] }), _jsxs("div", { className: "flex gap-2", children: [_jsx("button", { className: "btn", onClick: markAttendance, children: "Mark attendance" }), _jsx("button", { className: "btn-secondary", onClick: exportCSV, children: "Export CSV" })] })] })] })] }), _jsxs("section", { className: "mt-6 rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Live Readings" }), _jsx("div", { className: "grid grid-cols-1 gap-2 md:grid-cols-3", children: snapshots.slice(-6).reverse().map((s, i) => (_jsxs("div", { className: "rounded border p-3 text-sm", children: [_jsx("div", { className: "font-mono text-xs text-slate-500", children: new Date(s.timestamp).toLocaleTimeString() }), s.faces.slice(0, 3).map((f, idx) => (_jsxs("div", { className: "mt-1", children: [_jsxs("div", { children: ["Emotion: ", _jsx("b", { children: f.emotion }), " (", (f.confidence * 100).toFixed(1), "%)"] }), _jsxs("div", { children: ["Attention: ", _jsxs("b", { children: [(f.attention * 100).toFixed(0), "%"] })] })] }, idx))), s.faces.length === 0 && _jsx("div", { className: "text-slate-500", children: "No face" })] }, i))) })] }), _jsx("footer", { className: "mt-6 text-xs text-slate-500", children: "Realtime writes to emotion_stream when a student ID is set. CSV export stores local snapshots." })] }));
 }

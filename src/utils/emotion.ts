@@ -12,6 +12,13 @@ export async function setupModels() {
   modelsLoaded = true
 }
 
+export type FaceReading = {
+  emotion: string
+  confidence: number
+  attention: number
+  box: { x: number; y: number; width: number; height: number }
+}
+
 export async function analyzeFrame(video: HTMLVideoElement): Promise<{
   emotion: string,
   confidence: number,
@@ -37,4 +44,30 @@ export async function analyzeFrame(video: HTMLVideoElement): Promise<{
   const normAttention = Math.max(0, Math.min(1, faceArea / (video.videoWidth * video.videoHeight / 6)))
 
   return { emotion: top.key, confidence: top.value, attention: normAttention }
+}
+
+export async function analyzeFrameMulti(video: HTMLVideoElement): Promise<FaceReading[]> {
+  if (!modelsLoaded) return []
+  const detections = await faceapi
+    .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 }))
+    .withFaceExpressions()
+
+  if (!detections || detections.length === 0) return []
+
+  return detections.map(d => {
+    const expressions = d.expressions
+    let top: { key: string, value: number } = { key: 'neutral', value: 0 }
+    for (const [k, v] of Object.entries(expressions)) {
+      if (v > top.value) top = { key: k, value: v }
+    }
+    const box = d.detection.box
+    const faceArea = box.width * box.height
+    const normAttention = Math.max(0, Math.min(1, faceArea / (video.videoWidth * video.videoHeight / 6)))
+    return {
+      emotion: top.key,
+      confidence: top.value,
+      attention: normAttention,
+      box: { x: box.x, y: box.y, width: box.width, height: box.height }
+    }
+  })
 }
