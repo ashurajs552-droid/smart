@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { setupModels, analyzeFrameMulti, type FaceReading } from './utils/emotion'
+import { setupModels, analyzeFrameMulti, analyzeFrameRecognize, type FaceReading } from './utils/emotion'
+import { loadRosterFromSupabase, buildMatcher, type Matcher } from './utils/recognition'
 import Papa from 'papaparse'
 import './index.css'
 import supabase from './lib/supabaseClient'
@@ -18,6 +19,9 @@ export default function App() {
   const [streaming, setStreaming] = useState(false)
   const [autoAttendance, setAutoAttendance] = useState(true)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const [matcher, setMatcher] = useState<Matcher>(null)
+  const lastMarkedRef = useRef<Record<string, number>>({})
+  const lastRecognizeAtRef = useRef<number>(0)
 
   // Load models once, then auto-start camera
   useEffect(() => {
@@ -27,7 +31,35 @@ export default function App() {
   // Process frames (multi-face)
   const loop = useCallback(async () => {
     if (!videoRef.current) return
-    const faces = await analyzeFrameMulti(videoRef.current)
+
+    // Throttle descriptor-based recognition to ~1fps for performance
+    const now = Date.now()
+    let faces: FaceReading[] = []
+    if (matcher && now - lastRecognizeAtRef.current > 1000) {
+      lastRecognizeAtRef.current = now
+      const rich = await analyzeFrameRecognize(videoRef.current, { inputSize: 160 })
+      faces = rich
+      // Mark attendance for recognized labels (id::name)
+      for (const r of rich) {
+        const best = matcher.findBestMatch(r.descriptor)
+        if (best.label !== 'unknown' && best.distance < 0.6) {
+          const [sid, sname] = best.label.split('::')
+          const last = lastMarkedRef.current[sid] || 0
+          if (now - last > 5 * 60 * 1000) { // 5 min dedupe window
+            await supabase.from('attendance').insert({
+              student_id: sid,
+              student_name: sname,
+              at: new Date().toISOString(),
+              emotion: r.emotion,
+              attention: r.attention
+            })
+            lastMarkedRef.current[sid] = now
+          }
+        }
+      }
+    } else {
+      faces = await analyzeFrameMulti(videoRef.current, { inputSize: 160 })
+    }
 
     // draw overlay
     if (canvasRef.current && videoRef.current) {
@@ -71,16 +103,28 @@ export default function App() {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
     if (videoRef.current) {
       videoRef.current.srcObject = stream
-      await videoRef.current.play()
-      // size canvas to video
-      if (canvasRef.current) {
-        canvasRef.current.width = videoRef.current.videoWidth
-        canvasRef.current.height = videoRef.current.videoHeight
+      // Ensure autoplay works on mobile
+      videoRef.current.muted = true
+      ;(videoRef.current as any).playsInline = true
+      const onMeta = () => {
+        if (!videoRef.current) return
+        if (canvasRef.current) {
+          canvasRef.current.width = videoRef.current.videoWidth
+          canvasRef.current.height = videoRef.current.videoHeight
+        }
+        setStreaming(true)
+        loop()
       }
-      setStreaming(true)
-      loop()
+      videoRef.current.onloadedmetadata = onMeta
+      await videoRef.current.play().catch(() => {/* ignore; will play after metadata */})
     }
   }, [loop])
+
+  // Load roster and build matcher once models are ready
+  useEffect(() => {
+    if (!ready) return
+    loadRosterFromSupabase(supabase).then(entries => setMatcher(buildMatcher(entries))).catch(() => setMatcher(null))
+  }, [ready])
 
   // Auto-start camera after models are ready
   useEffect(() => {
@@ -150,7 +194,7 @@ export default function App() {
         <div className="rounded-lg border bg-white p-4 shadow-sm">
           <h2 className="mb-2 font-medium">Camera</h2>
           <div className="relative w-full">
-            <video ref={videoRef} className="w-full rounded border" />
+            <video ref={videoRef} className="w-full rounded border" autoPlay muted playsInline />
             <canvas ref={canvasRef} className="pointer-events-none absolute left-0 top-0 h-full w-full" />
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">

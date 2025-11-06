@@ -6,7 +6,9 @@ export async function setupModels() {
     const MODEL_URL = 'https://cdn.jsdelivr.net/npm/face-api.js/models';
     await Promise.all([
         faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-        faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL)
+        faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+        faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
     ]);
     modelsLoaded = true;
 }
@@ -18,24 +20,24 @@ export async function analyzeFrame(video) {
         .withFaceExpressions();
     if (!detections)
         return { emotion: 'no-face', confidence: 0, attention: 0 };
-    // emotion with highest probability
     const expressions = detections.expressions;
     let top = { key: 'neutral', value: 0 };
     for (const [k, v] of Object.entries(expressions)) {
         if (v > top.value)
             top = { key: k, value: v };
     }
-    // naive attention proxy: larger face box => closer/attentive (normalized), ensure [0..1]
     const box = detections.detection.box;
     const faceArea = box.width * box.height;
     const normAttention = Math.max(0, Math.min(1, faceArea / (video.videoWidth * video.videoHeight / 6)));
     return { emotion: top.key, confidence: top.value, attention: normAttention };
 }
-export async function analyzeFrameMulti(video) {
+export async function analyzeFrameMulti(video, opts) {
     if (!modelsLoaded)
         return [];
+    const inputSize = opts?.inputSize ?? 192;
+    const scoreThreshold = opts?.scoreThreshold ?? 0.4;
     const detections = await faceapi
-        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 }))
+        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold }))
         .withFaceExpressions();
     if (!detections || detections.length === 0)
         return [];
@@ -54,6 +56,35 @@ export async function analyzeFrameMulti(video) {
             confidence: top.value,
             attention: normAttention,
             box: { x: box.x, y: box.y, width: box.width, height: box.height }
+        };
+    });
+}
+export async function analyzeFrameRecognize(video, opts) {
+    if (!modelsLoaded)
+        return [];
+    const inputSize = opts?.inputSize ?? 192;
+    const scoreThreshold = opts?.scoreThreshold ?? 0.4;
+    const results = await faceapi
+        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold }))
+        .withFaceLandmarks()
+        .withFaceExpressions()
+        .withFaceDescriptors();
+    return results.map(r => {
+        const expressions = r.expressions;
+        let top = { key: 'neutral', value: 0 };
+        for (const [k, v] of Object.entries(expressions)) {
+            if (v > top.value)
+                top = { key: k, value: v };
+        }
+        const box = r.detection.box;
+        const faceArea = box.width * box.height;
+        const attention = Math.max(0, Math.min(1, faceArea / (video.videoWidth * video.videoHeight / 6)));
+        return {
+            emotion: top.key,
+            confidence: top.value,
+            attention,
+            box: { x: box.x, y: box.y, width: box.width, height: box.height },
+            descriptor: r.descriptor
         };
     });
 }
