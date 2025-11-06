@@ -1,16 +1,31 @@
 import * as faceapi from 'face-api.js'
+import * as tf from '@tensorflow/tfjs'
 
 let modelsLoaded = false
 
 export async function setupModels() {
   if (modelsLoaded) return
-  const MODEL_URL = 'https://cdn.jsdelivr.net/npm/face-api.js/models'
-  await Promise.all([
-    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-    faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
-    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
-  ])
+  // Ensure the fastest backend where available
+  try { await tf.setBackend('webgl') } catch {}
+  await tf.ready()
+
+  const BASES = ['/models', 'https://cdn.jsdelivr.net/npm/face-api.js/models']
+  let loaded = false
+  for (const base of BASES) {
+    try {
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(base),
+        faceapi.nets.faceExpressionNet.loadFromUri(base),
+        faceapi.nets.faceLandmark68Net.loadFromUri(base),
+        faceapi.nets.faceRecognitionNet.loadFromUri(base)
+      ])
+      loaded = true
+      break
+    } catch (e) {
+      // try next base
+    }
+  }
+  if (!loaded) throw new Error('Failed to load face-api models')
   modelsLoaded = true
 }
 

@@ -8,6 +8,7 @@ import supabase from './lib/supabaseClient';
 export default function App() {
     const videoRef = useRef(null);
     const [ready, setReady] = useState(false);
+    const [modelError, setModelError] = useState(null);
     const [snapshots, setSnapshots] = useState([]);
     const [studentId, setStudentId] = useState('');
     const [studentName, setStudentName] = useState('');
@@ -19,7 +20,10 @@ export default function App() {
     const lastRecognizeAtRef = useRef(0);
     // Load models once, then auto-start camera
     useEffect(() => {
-        setupModels().then(() => setReady(true)).catch(console.error);
+        setupModels().then(() => setReady(true)).catch((e) => {
+            console.error(e);
+            setModelError('Failed to load ML models. Check network and CORS.');
+        });
     }, []);
     // Process frames (multi-face)
     const loop = useCallback(async () => {
@@ -90,8 +94,13 @@ export default function App() {
     }, [streaming, studentId]);
     // Start webcam
     const startCamera = useCallback(async () => {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-        if (videoRef.current) {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+                audio: false
+            });
+            if (!videoRef.current)
+                return;
             videoRef.current.srcObject = stream;
             // Ensure autoplay works on mobile
             videoRef.current.muted = true;
@@ -108,6 +117,10 @@ export default function App() {
             };
             videoRef.current.onloadedmetadata = onMeta;
             await videoRef.current.play().catch(() => { });
+        }
+        catch (err) {
+            setModelError(err?.message || 'Camera permission denied or unavailable');
+            console.error(err);
         }
     }, [loop]);
     // Load roster and build matcher once models are ready
@@ -173,5 +186,5 @@ export default function App() {
         a.click();
         URL.revokeObjectURL(url);
     }
-    return (_jsxs("div", { className: "min-h-screen p-6 text-slate-900", children: [_jsx("h1", { className: "text-2xl font-semibold", children: "Edu Vision Dashboard" }), _jsxs("section", { className: "mt-4 grid gap-6 md:grid-cols-2", children: [_jsxs("div", { className: "rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Camera" }), _jsxs("div", { className: "relative w-full", children: [_jsx("video", { ref: videoRef, className: "w-full rounded border", autoPlay: true, muted: true, playsInline: true }), _jsx("canvas", { ref: canvasRef, className: "pointer-events-none absolute left-0 top-0 h-full w-full" })] }), _jsxs("div", { className: "mt-3 flex flex-wrap items-center gap-2", children: [_jsx("button", { className: "btn", disabled: !ready || streaming, onClick: startCamera, children: "Start" }), _jsx("button", { className: "btn", disabled: !streaming, onClick: stopCamera, children: "Stop" }), !ready && _jsx("span", { className: "text-sm text-slate-500", children: "Loading models..." })] })] }), _jsxs("div", { className: "rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Student & Attendance" }), _jsxs("div", { className: "flex flex-col gap-2", children: [_jsx("input", { className: "input", placeholder: "Student ID", value: studentId, onChange: e => setStudentId(e.target.value) }), _jsx("input", { className: "input", placeholder: "Student Name", value: studentName, onChange: e => setStudentName(e.target.value) }), _jsxs("label", { className: "flex items-center gap-2 text-sm text-slate-600", children: [_jsx("input", { type: "checkbox", checked: autoAttendance, onChange: e => setAutoAttendance(e.target.checked) }), "Auto-mark attendance every 30s"] }), _jsxs("div", { className: "flex gap-2", children: [_jsx("button", { className: "btn", onClick: markAttendance, children: "Mark attendance" }), _jsx("button", { className: "btn-secondary", onClick: exportCSV, children: "Export CSV" })] })] })] })] }), _jsxs("section", { className: "mt-6 rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Live Readings" }), _jsx("div", { className: "grid grid-cols-1 gap-2 md:grid-cols-3", children: snapshots.slice(-6).reverse().map((s, i) => (_jsxs("div", { className: "rounded border p-3 text-sm", children: [_jsx("div", { className: "font-mono text-xs text-slate-500", children: new Date(s.timestamp).toLocaleTimeString() }), s.faces.slice(0, 3).map((f, idx) => (_jsxs("div", { className: "mt-1", children: [_jsxs("div", { children: ["Emotion: ", _jsx("b", { children: f.emotion }), " (", (f.confidence * 100).toFixed(1), "%)"] }), _jsxs("div", { children: ["Attention: ", _jsxs("b", { children: [(f.attention * 100).toFixed(0), "%"] })] })] }, idx))), s.faces.length === 0 && _jsx("div", { className: "text-slate-500", children: "No face" })] }, i))) })] }), _jsx("footer", { className: "mt-6 text-xs text-slate-500", children: "Realtime writes to emotion_stream when a student ID is set. CSV export stores local snapshots." })] }));
+    return (_jsxs("div", { className: "min-h-screen p-6 text-slate-900", children: [_jsx("h1", { className: "text-2xl font-semibold", children: "Edu Vision Dashboard" }), _jsxs("section", { className: "mt-4 grid gap-6 md:grid-cols-2", children: [_jsxs("div", { className: "rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Camera" }), _jsxs("div", { className: "relative w-full", children: [_jsx("video", { ref: videoRef, className: "w-full rounded border", autoPlay: true, muted: true, playsInline: true }), _jsx("canvas", { ref: canvasRef, className: "pointer-events-none absolute left-0 top-0 h-full w-full" })] }), _jsxs("div", { className: "mt-3 flex flex-wrap items-center gap-2", children: [_jsx("button", { className: "btn", disabled: !ready || streaming, onClick: startCamera, children: "Start" }), _jsx("button", { className: "btn", disabled: !streaming, onClick: stopCamera, children: "Stop" }), !ready && !modelError && _jsx("span", { className: "text-sm text-slate-500", children: "Loading models..." }), modelError && _jsx("span", { className: "text-sm text-red-600", children: modelError })] })] }), _jsxs("div", { className: "rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Student & Attendance" }), _jsxs("div", { className: "flex flex-col gap-2", children: [_jsx("input", { className: "input", placeholder: "Student ID", value: studentId, onChange: e => setStudentId(e.target.value) }), _jsx("input", { className: "input", placeholder: "Student Name", value: studentName, onChange: e => setStudentName(e.target.value) }), _jsxs("label", { className: "flex items-center gap-2 text-sm text-slate-600", children: [_jsx("input", { type: "checkbox", checked: autoAttendance, onChange: e => setAutoAttendance(e.target.checked) }), "Auto-mark attendance every 30s"] }), _jsxs("div", { className: "flex gap-2", children: [_jsx("button", { className: "btn", onClick: markAttendance, children: "Mark attendance" }), _jsx("button", { className: "btn-secondary", onClick: exportCSV, children: "Export CSV" })] })] })] })] }), _jsxs("section", { className: "mt-6 rounded-lg border bg-white p-4 shadow-sm", children: [_jsx("h2", { className: "mb-2 font-medium", children: "Live Readings" }), _jsx("div", { className: "grid grid-cols-1 gap-2 md:grid-cols-3", children: snapshots.slice(-6).reverse().map((s, i) => (_jsxs("div", { className: "rounded border p-3 text-sm", children: [_jsx("div", { className: "font-mono text-xs text-slate-500", children: new Date(s.timestamp).toLocaleTimeString() }), s.faces.slice(0, 3).map((f, idx) => (_jsxs("div", { className: "mt-1", children: [_jsxs("div", { children: ["Emotion: ", _jsx("b", { children: f.emotion }), " (", (f.confidence * 100).toFixed(1), "%)"] }), _jsxs("div", { children: ["Attention: ", _jsxs("b", { children: [(f.attention * 100).toFixed(0), "%"] })] })] }, idx))), s.faces.length === 0 && _jsx("div", { className: "text-slate-500", children: "No face" })] }, i))) })] }), _jsx("footer", { className: "mt-6 text-xs text-slate-500", children: "Realtime writes to emotion_stream when a student ID is set. CSV export stores local snapshots." })] }));
 }

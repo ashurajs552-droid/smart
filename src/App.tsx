@@ -13,6 +13,7 @@ export type EmotionSnapshot = {
 export default function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const [ready, setReady] = useState(false)
+  const [modelError, setModelError] = useState<string | null>(null)
   const [snapshots, setSnapshots] = useState<EmotionSnapshot[]>([])
   const [studentId, setStudentId] = useState('')
   const [studentName, setStudentName] = useState('')
@@ -25,7 +26,10 @@ export default function App() {
 
   // Load models once, then auto-start camera
   useEffect(() => {
-    setupModels().then(() => setReady(true)).catch(console.error)
+    setupModels().then(() => setReady(true)).catch((e) => {
+      console.error(e)
+      setModelError('Failed to load ML models. Check network and CORS.')
+    })
   }, [])
 
   // Process frames (multi-face)
@@ -100,8 +104,12 @@ export default function App() {
 
   // Start webcam
   const startCamera = useCallback(async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
-    if (videoRef.current) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      })
+      if (!videoRef.current) return
       videoRef.current.srcObject = stream
       // Ensure autoplay works on mobile
       videoRef.current.muted = true
@@ -117,6 +125,9 @@ export default function App() {
       }
       videoRef.current.onloadedmetadata = onMeta
       await videoRef.current.play().catch(() => {/* ignore; will play after metadata */})
+    } catch (err: any) {
+      setModelError(err?.message || 'Camera permission denied or unavailable')
+      console.error(err)
     }
   }, [loop])
 
@@ -200,7 +211,8 @@ export default function App() {
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button className="btn" disabled={!ready || streaming} onClick={startCamera}>Start</button>
             <button className="btn" disabled={!streaming} onClick={stopCamera}>Stop</button>
-            {!ready && <span className="text-sm text-slate-500">Loading models...</span>}
+            {!ready && !modelError && <span className="text-sm text-slate-500">Loading models...</span>}
+            {modelError && <span className="text-sm text-red-600">{modelError}</span>}
           </div>
         </div>
 
