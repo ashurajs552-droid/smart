@@ -1,31 +1,40 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { setupModels, analyzeFrameMulti, analyzeFrameRecognize, type FaceReading } from './utils/emotion'
+import { setupModels, analyzeFrameMulti, analyzeFrameRecognize, configureEmotion, type FaceReading } from './utils/emotion'
 import { loadRosterFromSupabase, buildMatcher, type Matcher } from './utils/recognition'
 import Papa from 'papaparse'
 import './index.css'
 import supabase from './lib/supabaseClient'
+import Dashboard from './components/Dashboard'
+import Enroll from './components/Enroll'
+import LandingPage from './components/LandingPage'
 
+type RecognizedFace = FaceReading & { student_id?: string; student_name?: string }
 export type EmotionSnapshot = {
   timestamp: number
-  faces: FaceReading[]
+  faces: RecognizedFace[]
 }
 
 export default function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const [ready, setReady] = useState(false)
   const [modelError, setModelError] = useState<string | null>(null)
+  const [supabaseError, setSupabaseError] = useState<string | null>(null)
   const [snapshots, setSnapshots] = useState<EmotionSnapshot[]>([])
-  const [studentId, setStudentId] = useState('')
-  const [studentName, setStudentName] = useState('')
   const [streaming, setStreaming] = useState(false)
-  const [autoAttendance, setAutoAttendance] = useState(true)
+  const [authed, setAuthed] = useState(false)
+  const [showLanding, setShowLanding] = useState(true)
+  const [highAccuracy, setHighAccuracy] = useState(false)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const [matcher, setMatcher] = useState<Matcher>(null)
   const lastMarkedRef = useRef<Record<string, number>>({})
   const lastRecognizeAtRef = useRef<number>(0)
+  const latestFacesRef = useRef<RecognizedFace[]>([])
+  const captureIntervalMs = 5000
 
   // Load models once, then auto-start camera
   useEffect(() => {
+    // enable smoothing + quality gate
+    configureEmotion({ smoothingAlpha: 0.6, qualityMin: 0.3 })
     setupModels().then(() => setReady(true)).catch((e) => {
       console.error(e)
       setModelError('Failed to load ML models. Check network and CORS.')
@@ -42,28 +51,44 @@ export default function App() {
     if (matcher && now - lastRecognizeAtRef.current > 1000) {
       lastRecognizeAtRef.current = now
       const rich = await analyzeFrameRecognize(videoRef.current, { inputSize: 160 })
-      faces = rich
-      // Mark attendance for recognized labels (id::name)
-      for (const r of rich) {
-        const best = matcher.findBestMatch(r.descriptor)
-        if (best.label !== 'unknown' && best.distance < 0.6) {
-          const [sid, sname] = best.label.split('::')
-          const last = lastMarkedRef.current[sid] || 0
-          if (now - last > 5 * 60 * 1000) { // 5 min dedupe window
-            await supabase.from('attendance').insert({
-              student_id: sid,
-              student_name: sname,
-              at: new Date().toISOString(),
-              emotion: r.emotion,
-              attention: r.attention
-            })
-            lastMarkedRef.current[sid] = now
+      // attach identities
+      const recognized: RecognizedFace[] = rich.map(r => {
+        let sid: string | undefined, sname: string | undefined
+        if (matcher) {
+          const best = matcher.findBestMatch(r.descriptor)
+          if (best.label !== 'unknown' && best.distance < 0.6) {
+            const parts = best.label.split('::')
+            sid = parts[0]; sname = parts[1]
           }
+        }
+        return { ...r, student_id: sid, student_name: sname }
+      })
+      faces = recognized
+      // auto attendance mark with 5min dedupe per recognized student
+      for (const rf of recognized) {
+        if (!rf.student_id) continue
+        const sid = rf.student_id
+        const sname = rf.student_name!
+        const last = lastMarkedRef.current[sid] || 0
+        if (now - last > 5 * 60 * 1000) {
+          const { error } = await supabase.from('attendance').insert({
+            student_id: sid,
+            student_name: sname,
+            at: new Date().toISOString(),
+            emotion: rf.emotion,
+            attention: rf.attention
+          })
+          if (error) setSupabaseError(error.message)
+          else lastMarkedRef.current[sid] = now
         }
       }
     } else {
-      faces = await analyzeFrameMulti(videoRef.current, { inputSize: 160 })
+      const useSSD = highAccuracy || (now - lastRecognizeAtRef.current < 50)
+      faces = await analyzeFrameMulti(videoRef.current, { inputSize: useSSD ? 256 : 224, detector: useSSD ? 'ssd' : 'tiny' })
     }
+
+    // always keep latest faces for 5s snapshotter
+    latestFacesRef.current = faces as RecognizedFace[]
 
     // draw overlay
     if (canvasRef.current && videoRef.current) {
@@ -77,30 +102,15 @@ export default function App() {
         ctx.strokeRect(f.box.x, f.box.y, f.box.width, f.box.height)
         ctx.fillRect(f.box.x, f.box.y + f.box.height + 2, f.box.width, 16)
         ctx.fillStyle = '#0ea5e9'
-        ctx.fillText(`${f.emotion} ${(f.confidence*100).toFixed(0)}%`, f.box.x + 4, f.box.y + f.box.height + 14)
+        ctx.fillText(`${f.emotion} ${(f.confidence*100).toFixed(0)}% | Attn ${(f.attention*100).toFixed(0)}% | Eng ${(f.engagement*100).toFixed(0)}%`, f.box.x + 4, f.box.y + f.box.height + 14)
         ctx.fillStyle = 'rgba(14,165,233,0.2)'
       })
     }
 
-    setSnapshots(prev => [
-      ...prev.slice(-120), // keep last ~120 frames
-      { timestamp: Date.now(), faces }
-    ])
-
-    // upsert latest single reading if studentId set (choose highest-attention face)
-    if (studentId && faces.length) {
-      const top = faces.reduce((a, b) => (b.attention > a.attention ? b : a), faces[0])
-      await supabase.from('emotion_stream').upsert({
-        student_id: studentId,
-        at: new Date().toISOString(),
-        emotion: top.emotion,
-        confidence: top.confidence,
-        attention: top.attention
-      })
-    }
+    // overlay only; snapshots are pushed by the 5s timer
 
     if (streaming) requestAnimationFrame(loop)
-  }, [streaming, studentId])
+  }, [streaming, matcher, highAccuracy])
 
   // Start webcam
   const startCamera = useCallback(async () => {
@@ -131,58 +141,77 @@ export default function App() {
     }
   }, [loop])
 
-  // Load roster and build matcher once models are ready
+  // Auth gate - handle authentication state changes
   useEffect(() => {
-    if (!ready) return
-    loadRosterFromSupabase(supabase).then(entries => setMatcher(buildMatcher(entries))).catch(() => setMatcher(null))
-  }, [ready])
-
-  // Auto-start camera after models are ready
-  useEffect(() => {
-    if (ready && !streaming) {
-      startCamera().catch(console.error)
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session) {
+        setAuthed(true)
+        setShowLanding(false)
+      }
+    })
+    
+    return () => {
+      sub.subscription.unsubscribe()
     }
-  }, [ready, streaming, startCamera])
+  }, [])
+
+  // Load roster and build matcher once models are ready and authed
+  useEffect(() => {
+    if (!ready || !authed) return
+    loadRosterFromSupabase(supabase).then(entries => setMatcher(buildMatcher(entries))).catch(() => setMatcher(null))
+  }, [ready, authed])
+
+  // Auto-start camera disabled - user must click Start button
 
   // Stop webcam
   function stopCamera() {
-    if (videoRef.current?.srcObject) {
-      const tracks = (videoRef.current.srcObject as MediaStream).getTracks()
-      tracks.forEach(t => t.stop())
-      setStreaming(false)
+    if (videoRef.current) {
+      if (videoRef.current.srcObject) {
+        const tracks = (videoRef.current.srcObject as MediaStream).getTracks()
+        tracks.forEach(t => t.stop())
+      }
+      videoRef.current.srcObject = null
+    }
+    setStreaming(false)
+    // clear overlay
+    if (canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d')!
+      ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
     }
   }
 
-  // Mark attendance with latest snapshot
-  const markAttendance = useCallback(async () => {
-    if (!studentId || !studentName) return
-    const latest = snapshots[snapshots.length - 1]
-    const face = latest?.faces?.[0]
-    const { error } = await supabase.from('attendance').insert({
-      student_id: studentId,
-      student_name: studentName,
-      at: new Date().toISOString(),
-      emotion: face?.emotion ?? null,
-      attention: face?.attention ?? null
-    })
-    if (error) alert(error.message)
-  }, [snapshots, studentId, studentName])
+  // Manual attendance removed; recognition auto-marks attendance.
 
-  // Auto attendance interval
+  // 5s snapshot + realtime upsert using most recent faces (more stable & accurate)
   useEffect(() => {
-    if (!autoAttendance || !studentId || !studentName) return
-    const id = setInterval(() => {
-      markAttendance().catch(console.error)
-    }, 30_000)
+    const id = setInterval(async () => {
+      const faces = latestFacesRef.current
+      setSnapshots(prev => [...prev.slice(-120), { timestamp: Date.now(), faces }])
+      // upsert all recognized faces into emotion_stream
+      for (const f of faces) {
+        if (!f.student_id) continue
+        const { error } = await supabase.from('emotion_stream').upsert({
+          student_id: f.student_id,
+          at: new Date().toISOString(),
+          emotion: f.emotion,
+          confidence: f.confidence,
+          attention: f.attention
+        })
+        if (error) setSupabaseError(error.message)
+      }
+    }, captureIntervalMs)
     return () => clearInterval(id)
-  }, [autoAttendance, studentId, studentName, markAttendance])
+  }, [])
 
   const csvData = useMemo(() => {
     return snapshots.flatMap(s => s.faces.map(f => ({
       timestamp: new Date(s.timestamp).toISOString(),
       emotion: f.emotion,
       confidence: f.confidence.toFixed(3),
-      attention: f.attention.toFixed(3)
+      attention: f.attention.toFixed(3),
+      yaw: f.yaw.toFixed(3),
+      pitch: f.pitch.toFixed(3),
+      engagement: f.engagement.toFixed(3)
     })))
   }, [snapshots])
 
@@ -192,14 +221,25 @@ export default function App() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${studentId || 'student'}-history.csv`
+    a.download = `session-history.csv`
     a.click()
     URL.revokeObjectURL(url)
   }
 
+  // Show landing page if not authed OR if explicitly showing landing
+  if (!authed || showLanding) {
+    return <LandingPage onSignIn={() => {
+      setAuthed(true)
+      setShowLanding(false)
+    }} />
+  }
+
   return (
     <div className="min-h-screen p-6 text-slate-900">
-      <h1 className="text-2xl font-semibold">Edu Vision Dashboard</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-semibold">Smart Class Monitor</h1>
+        <button className="btn-secondary" onClick={() => supabase.auth.signOut()}>Sign out</button>
+      </div>
 
       <section className="mt-4 grid gap-6 md:grid-cols-2">
         <div className="rounded-lg border bg-white p-4 shadow-sm">
@@ -208,25 +248,23 @@ export default function App() {
             <video ref={videoRef} className="w-full rounded border" autoPlay muted playsInline />
             <canvas ref={canvasRef} className="pointer-events-none absolute left-0 top-0 h-full w-full" />
           </div>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
+          <div className="mt-3 flex flex-wrap items-center gap-3">
             <button className="btn" disabled={!ready || streaming} onClick={startCamera}>Start</button>
             <button className="btn" disabled={!streaming} onClick={stopCamera}>Stop</button>
+            <label className="flex items-center gap-2 text-sm text-slate-600">
+              <input type="checkbox" checked={highAccuracy} onChange={e => setHighAccuracy(e.target.checked)} /> High accuracy (SSD)
+            </label>
             {!ready && !modelError && <span className="text-sm text-slate-500">Loading models...</span>}
             {modelError && <span className="text-sm text-red-600">{modelError}</span>}
           </div>
         </div>
 
+        <Enroll videoRef={videoRef} />
         <div className="rounded-lg border bg-white p-4 shadow-sm">
-          <h2 className="mb-2 font-medium">Student & Attendance</h2>
+          <h2 className="mb-2 font-medium">Export</h2>
           <div className="flex flex-col gap-2">
-            <input className="input" placeholder="Student ID" value={studentId} onChange={e => setStudentId(e.target.value)} />
-            <input className="input" placeholder="Student Name" value={studentName} onChange={e => setStudentName(e.target.value)} />
-            <label className="flex items-center gap-2 text-sm text-slate-600">
-              <input type="checkbox" checked={autoAttendance} onChange={e => setAutoAttendance(e.target.checked)} />
-              Auto-mark attendance every 30s
-            </label>
+            <div className="text-sm text-slate-600">Recognition is automatic; attendance is marked per recognized student. Use Enroll to add a student USN.</div>
             <div className="flex gap-2">
-              <button className="btn" onClick={markAttendance}>Mark attendance</button>
               <button className="btn-secondary" onClick={exportCSV}>Export CSV</button>
             </div>
           </div>
@@ -235,24 +273,15 @@ export default function App() {
 
       <section className="mt-6 rounded-lg border bg-white p-4 shadow-sm">
         <h2 className="mb-2 font-medium">Live Readings</h2>
-        <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
-          {snapshots.slice(-6).reverse().map((s, i) => (
-            <div key={i} className="rounded border p-3 text-sm">
-              <div className="font-mono text-xs text-slate-500">{new Date(s.timestamp).toLocaleTimeString()}</div>
-              {s.faces.slice(0,3).map((f, idx) => (
-                <div key={idx} className="mt-1">
-                  <div>Emotion: <b>{f.emotion}</b> ({(f.confidence*100).toFixed(1)}%)</div>
-                  <div>Attention: <b>{(f.attention*100).toFixed(0)}%</b></div>
-                </div>
-              ))}
-              {s.faces.length === 0 && <div className="text-slate-500">No face</div>}
-            </div>
-          ))}
-        </div>
+        <Dashboard snapshots={snapshots} />
       </section>
 
       <footer className="mt-6 text-xs text-slate-500">
-        Realtime writes to emotion_stream when a student ID is set. CSV export stores local snapshots.
+        {supabaseError ? (
+          <div className="text-red-600">Supabase error: {supabaseError}. Ensure tables exist (students, emotion_stream, attendance) and env keys are correct.</div>
+        ) : (
+          <div>Realtime writes to emotion_stream for recognized students. CSV export stores local snapshots.</div>
+        )}
       </footer>
     </div>
   )
