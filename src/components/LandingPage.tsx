@@ -3,13 +3,7 @@ import supabase from '../lib/supabaseClient'
 
 export default function LandingPage({ onSignIn }: { onSignIn?: () => void }) {
   async function signInGoogle() {
-    // For localhost/dev, just proceed to dashboard
-    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-      onSignIn?.()
-      return
-    }
-    
-    // For production, use actual Google OAuth
+    // Use Supabase Google OAuth for all environments
     const { error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: {
@@ -17,8 +11,11 @@ export default function LandingPage({ onSignIn }: { onSignIn?: () => void }) {
         queryParams: { prompt: 'select_account' }
       }
     })
-    if (error) alert(`Google sign-in failed: ${error.message}`)
-    else onSignIn?.()
+    if (error) {
+      console.error('Google sign-in error:', error)
+      alert(`Google sign-in failed: ${error.message}`)
+    }
+    // onSignIn will be called automatically by auth state change listener
   }
 
   return (

@@ -141,12 +141,24 @@ export default function App() {
     }
   }, [loop])
 
-  // Auth gate - handle authentication state changes
+  // Auth gate - check Supabase session on any device
   useEffect(() => {
+    // Check for existing session
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session) {
+        setAuthed(true)
+        setShowLanding(false)
+      }
+    })
+    
+    // Listen for auth state changes
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session) {
         setAuthed(true)
         setShowLanding(false)
+      } else {
+        setAuthed(false)
+        setShowLanding(true)
       }
     })
     
